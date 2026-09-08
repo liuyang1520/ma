@@ -1,0 +1,25 @@
+# Local build outputs and dependency caches
+/bin/
+/.cache/
+/artifacts/
+/dist/
+*.test
+*.prof
+/coverage.out
+
+# Python helpers
+__pycache__/
+*.py[cod]
+
+# Local configuration, credentials, and editor files
+.env
+.env.*
+!.env.example
+/.codex/
+/.agents/
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
