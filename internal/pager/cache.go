@@ -2,6 +2,7 @@ package pager
 
 import (
 	"fmt"
+	"image"
 	"io"
 	"math"
 	"strings"
@@ -20,9 +21,10 @@ type cachedBand struct {
 // the hidden image first, then switch placements: the old view stays visible
 // during the expensive work. No full-document raster or disk cache is used.
 type imageCache struct {
-	bands  [2]cachedBand
-	active int
-	errors int
+	bands   [2]cachedBand
+	active  int
+	errors  int
+	scratch *image.RGBA
 }
 
 func newImageCache() *imageCache {
@@ -62,13 +64,14 @@ func (c *imageCache) Present(w io.Writer, e *render.Engine, y float64, columns, 
 		bandHeight := min(3*pixelHeight, max(pixelHeight, 16_000_000/pixelWidth))
 		bandHeight = min(bandHeight, docHeight)
 		top := max(0, min(start-pixelHeight/2, docHeight-bandHeight))
-		canvas, err := e.Canvas(float64(top)/scale, float64(bandHeight)/scale)
+		canvas, err := e.CanvasInto(c.scratch, float64(top)/scale, float64(bandHeight)/scale)
 		if err != nil {
 			return metrics, err
 		}
 		if err = kitty.Upload(w, c.bands[chosen].id, canvas); err != nil {
 			return metrics, err
 		}
+		c.scratch = canvas
 		c.bands[chosen] = cachedBand{id: c.bands[chosen].id, top: top, height: bandHeight, revision: e.Revision(), valid: true}
 	}
 	band := c.bands[chosen]

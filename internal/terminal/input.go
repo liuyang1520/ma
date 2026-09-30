@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -12,6 +13,12 @@ import (
 type Event struct {
 	Key, Text string
 	A, B      int
+	Mouse     *Mouse
+}
+
+type Mouse struct {
+	X, Y, Button, Modifiers int
+	Released, Motion        bool
 }
 
 // Decoder tolerates escape sequences and UTF-8 split across arbitrary reads.
@@ -46,6 +53,8 @@ func (d *Decoder) Feed(data []byte) []Event {
 				key = "enter"
 			case 127, 8:
 				key = "backspace"
+			case 9:
+				key = "tab"
 			}
 			events = append(events, Event{Key: key, Text: string(r)})
 			continue
@@ -78,7 +87,7 @@ func (d *Decoder) Feed(data []byte) []Event {
 			}
 			seq := string(p[2 : end+1])
 			d.pending = p[end+1:]
-			key := map[string]string{"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end", "1~": "home", "4~": "end", "5~": "pageup", "6~": "pagedown", "7~": "home", "8~": "end"}[seq]
+			key := map[string]string{"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end", "1~": "home", "4~": "end", "5~": "pageup", "6~": "pagedown", "7~": "home", "8~": "end", "Z": "backtab", "1;3D": "back", "1;3C": "forward"}[seq]
 			if key != "" {
 				events = append(events, Event{Key: key})
 				continue
@@ -89,15 +98,14 @@ func (d *Decoder) Feed(data []byte) []Event {
 					events = append(events, Event{Key: fmt.Sprintf("size%d", kind), A: a, B: b})
 				}
 			}
-			if strings.HasPrefix(seq, "<") && strings.HasSuffix(seq, "M") {
-				var button, x, y int
-				if _, err := fmt.Sscanf(seq, "<%d;%d;%dM", &button, &x, &y); err == nil {
-					if button == 64 {
-						events = append(events, Event{Key: "wheelup"})
-					}
-					if button == 65 {
-						events = append(events, Event{Key: "wheeldown"})
-					}
+			if strings.HasPrefix(seq, "?1016;") && strings.HasSuffix(seq, "$y") {
+				if state, err := strconv.Atoi(strings.TrimSuffix(strings.TrimPrefix(seq, "?1016;"), "$y")); err == nil {
+					events = append(events, Event{Key: "mousemode", A: state})
+				}
+			}
+			if strings.HasPrefix(seq, "<") && (strings.HasSuffix(seq, "M") || strings.HasSuffix(seq, "m")) {
+				if event, ok := mouseEvent(seq); ok {
+					events = append(events, event)
 				}
 			}
 			continue
@@ -106,6 +114,35 @@ func (d *Decoder) Feed(data []byte) []Event {
 		events = append(events, Event{Key: "escape"})
 	}
 	return events
+}
+
+func mouseEvent(seq string) (Event, bool) {
+	parts := strings.Split(seq[1:len(seq)-1], ";")
+	if len(parts) != 3 {
+		return Event{}, false
+	}
+	button, err1 := strconv.Atoi(parts[0])
+	x, err2 := strconv.Atoi(parts[1])
+	y, err3 := strconv.Atoi(parts[2])
+	if err1 != nil || err2 != nil || err3 != nil || button < 0 || button > 255 || x < 1 || y < 1 {
+		return Event{}, false
+	}
+	released := seq[len(seq)-1] == 'm'
+	if button&64 != 0 {
+		if !released && button&3 <= 1 {
+			key := "wheelup"
+			if button&3 == 1 {
+				key = "wheeldown"
+			}
+			return Event{Key: key}, true
+		}
+		return Event{}, false
+	}
+	which := button & 3
+	if button&128 != 0 {
+		which += 4
+	}
+	return Event{Key: "mouse", Mouse: &Mouse{X: x, Y: y, Button: which, Modifiers: button & 28, Released: released, Motion: button&32 != 0}}, true
 }
 
 func ReadEvents(r io.Reader, done <-chan struct{}) <-chan Event {

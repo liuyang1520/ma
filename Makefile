@@ -7,7 +7,7 @@ export GOFLAGS := -mod=readonly
 
 PREFIX ?= $(HOME)/.local
 
-.PHONY: deps build test integration bench release install clean
+.PHONY: deps build test integration bench bench-compression release install clean
 deps:
 	python3 scripts/deps.py download
 build:
@@ -19,6 +19,9 @@ integration: build
 	python3 scripts/pty_test.py
 bench:
 	go test ./internal/pager -run '^$$' -bench BenchmarkScrollTransport -benchmem
+	go test ./internal/render -run '^$$' -bench 'BenchmarkNative(Canvas|Layout)$$' -benchmem
+bench-compression:
+	go test ./internal/pager -run '^$$' -bench BenchmarkBandCompression -benchmem
 release:
 	python3 scripts/release.py
 install: build

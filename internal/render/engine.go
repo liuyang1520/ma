@@ -9,6 +9,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"sort"
 	"unicode"
 
 	"github.com/yuin/goldmark"
@@ -37,12 +38,14 @@ type span struct {
 	text    string
 	style   style
 	picture string
+	link    int
 }
 type glyph struct {
 	r           rune
 	x, y, w     float64
 	style       style
 	face, index int
+	link        int
 }
 type rect struct{ x, y, w, h float64 }
 type operation struct {
@@ -58,6 +61,25 @@ type matchRange struct {
 	y          float64
 }
 
+type Heading struct {
+	Text  string
+	ID    string
+	Level int
+	Y     float64
+}
+
+// Position ties a viewport to rendered text so reflow can preserve its place.
+type Position struct {
+	Index  int
+	Offset float64
+	Y      float64
+}
+
+type operationGroup struct {
+	start, end  int
+	top, bottom float64
+}
+
 type Engine struct {
 	ctx            context.Context
 	fonts          *fonts
@@ -69,8 +91,17 @@ type Engine struct {
 	scale          float64
 	palette        palette
 	ops            []operation
+	groups         []operationGroup
+	headings       []Heading
+	links          []Link
+	linkIDs        map[ast.Node]int
+	anchorIDs      map[string]int
+	focusedLink    int
+	geometry       uint64
 	glyphs         []glyph
 	text           []rune
+	line, word     []character
+	inks           map[color.RGBA]*image.Uniform
 	documentHeight float64
 	query          string
 	matches        []matchRange
@@ -90,7 +121,32 @@ func New(ctx context.Context) (*Engine, error) {
 }
 func (e *Engine) Close()                          { e.fonts.closeFaces() }
 func (e *Engine) Revision() uint64                { return e.revision }
+func (e *Engine) GeometryRevision() uint64        { return e.geometry }
 func (e *Engine) Dimensions() (int, int, float64) { return e.width, e.height, e.scale }
+func (e *Engine) Headings() []Heading             { return append([]Heading(nil), e.headings...) }
+
+func (e *Engine) Position(y float64) Position {
+	if y <= 0 {
+		return Position{Index: -1}
+	}
+	for _, op := range e.ops {
+		if op.end > op.start && op.y+op.h > y {
+			g := e.glyphs[op.start]
+			return Position{Index: g.index, Offset: y - g.y, Y: y}
+		}
+	}
+	return Position{Index: -1, Y: y}
+}
+
+func (e *Engine) Restore(p Position) float64 {
+	if p.Index >= 0 {
+		i := sort.Search(len(e.glyphs), func(i int) bool { return e.glyphs[i].index >= p.Index })
+		if i < len(e.glyphs) {
+			return e.Viewport(e.glyphs[i].y + p.Offset).Y
+		}
+	}
+	return e.Viewport(p.Y).Y
+}
 
 // Viewport describes scrolling without allocating or painting any pixels.
 func (e *Engine) Viewport(y float64) Metrics {
@@ -113,12 +169,17 @@ func (e *Engine) Load(source []byte, baseDir, theme string, fontSize int) error 
 	if e.root == nil || !bytes.Equal(e.source, source) || baseDir != e.baseDir {
 		e.source = bytes.Clone(source)
 		e.root = goldmark.New(goldmark.WithExtensions(extension.GFM)).Parser().Parse(text.NewReader(e.source))
+		if err := e.indexLinks(); err != nil {
+			return err
+		}
+		e.focusedLink = 0
 	}
 	e.images = make(map[string]image.Image)
 	e.imageBudget = 128 << 20
 	e.baseDir = baseDir
 	e.fontSize = float64(fontSize)
 	e.palette = colors(theme)
+	e.inks = make(map[color.RGBA]*image.Uniform)
 	return e.layout()
 }
 
@@ -129,6 +190,7 @@ func (e *Engine) Resize(width, height int, scale float64) error {
 	reflow := e.width != width
 	if e.width != width || e.height != height || e.scale != scale {
 		e.revision++
+		e.geometry++
 	}
 	e.width = width
 	e.height = height
@@ -140,10 +202,19 @@ func (e *Engine) Resize(width, height int, scale float64) error {
 }
 
 func (e *Engine) layout() error {
+	e.geometry++
 	e.fonts.closeFaces()
-	e.ops = nil
-	e.glyphs = nil
-	e.text = nil
+	clear(e.ops)
+	clear(e.headings)
+	e.ops = e.ops[:0]
+	e.glyphs = e.glyphs[:0]
+	e.text = e.text[:0]
+	e.headings = e.headings[:0]
+	e.groups = e.groups[:0]
+	e.anchorIDs = make(map[string]int)
+	for i := range e.links {
+		e.links[i].Rects = e.links[i].Rects[:0]
+	}
 	e.err = nil
 	padding := 32.0
 	if e.width < 600 {
@@ -155,6 +226,16 @@ func (e *Engine) layout() error {
 	e.documentHeight = y + padding
 	if e.err != nil {
 		return e.err
+	}
+	// Group extents preserve painting order, including table cells and large
+	// backgrounds, while skipping offscreen operations in batches.
+	for start := 0; start < len(e.ops); start += 64 {
+		group := operationGroup{start: start, end: min(start+64, len(e.ops)), top: math.Inf(1), bottom: math.Inf(-1)}
+		for _, op := range e.ops[group.start:group.end] {
+			group.top = math.Min(group.top, op.y)
+			group.bottom = math.Max(group.bottom, op.y+op.h)
+		}
+		e.groups = append(e.groups, group)
 	}
 	_, err := e.Search(e.query)
 	return err
@@ -201,7 +282,6 @@ func (e *Engine) Search(query string) ([]float64, error) {
 			j = 0
 		}
 	}
-	var offsets []float64
 	g := 0
 	for i := range e.matches {
 		for g < len(e.glyphs) && e.glyphs[g].index < e.matches[i].start {
@@ -210,9 +290,18 @@ func (e *Engine) Search(query string) ([]float64, error) {
 		if g < len(e.glyphs) {
 			e.matches[i].y = e.glyphs[g].y - e.glyphs[g].style.size
 		}
-		offsets = append(offsets, math.Max(0, e.matches[i].y))
 	}
-	return offsets, nil
+	return e.MatchOffsets(), nil
+}
+
+// Reflow already updates the search index; callers can retrieve new positions
+// without scanning the entire document again or resetting the active match.
+func (e *Engine) MatchOffsets() []float64 {
+	var offsets []float64
+	for _, match := range e.matches {
+		offsets = append(offsets, math.Max(0, match.y))
+	}
+	return offsets
 }
 func (e *Engine) SelectMatch(index int) error {
 	if e.active != index {

@@ -3,7 +3,7 @@
 set -eu
 umask 077
 
-VERSION='0.2.2'
+VERSION='0.3.0'
 REPOSITORY='liuyang1520/ma'
 prefix=${HOME:?HOME must be set}/.local
 work_dir=''

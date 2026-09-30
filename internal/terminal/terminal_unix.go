@@ -25,6 +25,7 @@ type Terminal struct {
 	done                  chan struct{}
 	cellWidth, cellHeight int
 	active                bool
+	PixelMouse            bool
 }
 
 func Open(force bool) (*Terminal, error) {
@@ -46,12 +47,19 @@ func Open(force bool) (*Terminal, error) {
 	t := &Terminal{file: f, old: old, Out: bufio.NewWriterSize(os.Stdout, 64<<10), done: make(chan struct{})}
 	t.Events = ReadEvents(f, t.done)
 	_ = kitty.Query(t.Out)
-	fmt.Fprint(t.Out, "\x1b[16t\x1b[14t")
+	fmt.Fprint(t.Out, "\x1b[16t\x1b[14t\x1b[?1016$p")
 	_ = t.Out.Flush()
 	supported := false
+	// Pixel dimensions from TIOCGWINSZ are sufficient even when a terminal
+	// acknowledges graphics without answering the optional cell-size query.
+	winsize, _ := unix.IoctlGetWinsize(int(f.Fd()), unix.TIOCGWINSZ)
+	knownPixels := winsize != nil && winsize.Xpixel > 0 && winsize.Ypixel > 0
 	timer := time.NewTimer(800 * time.Millisecond)
 probe:
 	for {
+		if force {
+			break probe
+		}
 		select {
 		case e, ok := <-t.Events:
 			if !ok || e.Key == "quit" {
@@ -63,10 +71,12 @@ probe:
 				supported = strings.HasSuffix(e.Text, ";OK")
 			}
 			if e.Key == "size6" {
-				t.cellHeight = e.A
-				t.cellWidth = e.B
+				t.UpdateCellSize(e)
 			}
-			if supported && t.cellHeight > 0 {
+			if e.Key == "mousemode" {
+				t.PixelMouse = e.A > 0 && e.A <= 4
+			}
+			if supported && (t.cellHeight > 0 || knownPixels) {
 				break probe
 			}
 		case <-timer.C:
@@ -79,12 +89,32 @@ probe:
 		return nil, fmt.Errorf("terminal did not acknowledge Kitty graphics; use Ghostty/Kitty, or --force-graphics to skip detection")
 	}
 	t.active = true
-	fmt.Fprint(t.Out, "\x1b[?1049h\x1b[?25l\x1b[?1000h\x1b[?1006h\x1b[2J")
+	fmt.Fprint(t.Out, "\x1b[?1049h\x1b[?25l\x1b[?1000;1006;1016s\x1b[?1016l\x1b[?1000h\x1b[?1006h\x1b[2J")
+	if t.PixelMouse {
+		fmt.Fprint(t.Out, "\x1b[?1016h")
+	}
 	if err = t.Out.Flush(); err != nil {
 		t.Close()
 		return nil, err
 	}
 	return t, nil
+}
+
+// A mode query reply can arrive after the graphics probe or in force mode.
+func (t *Terminal) UpdateMouseMode(e Event) error {
+	if e.Key == "mousemode" && e.A > 0 && e.A <= 4 && !t.PixelMouse {
+		t.PixelMouse = true
+		fmt.Fprint(t.Out, "\x1b[?1016h")
+		return t.Out.Flush()
+	}
+	return nil
+}
+
+// Queries may arrive after the capability probe, especially with --force-graphics.
+func (t *Terminal) UpdateCellSize(e Event) {
+	if e.Key == "size6" && e.A > 0 && e.B > 0 {
+		t.cellHeight, t.cellWidth = e.A, e.B
+	}
 }
 
 func (t *Terminal) Size() Size {
@@ -135,7 +165,7 @@ func (t *Terminal) Close() {
 	close(t.done)
 	if t.active {
 		_ = kitty.Delete(t.Out)
-		fmt.Fprint(t.Out, "\x1b[?1000l\x1b[?1006l\x1b[0m\x1b[?25h\x1b[?1049l")
+		fmt.Fprint(t.Out, "\x1b[?1000l\x1b[?1006l\x1b[?1016l\x1b[?1000;1006;1016r\x1b[0m\x1b[?25h\x1b[?1049l")
 	}
 	_ = t.Out.Flush()
 	_ = term.Restore(int(t.file.Fd()), t.old)

@@ -130,6 +130,22 @@ func (w *countWriter) Write(p []byte) (int, error) { w.n += int64(len(p)); retur
 func BenchmarkScrollTransport(b *testing.B) {
 	for _, scale := range []float64{1, 2} {
 		b.Run(fmt.Sprintf("scale%g", scale), func(b *testing.B) {
+			b.Run("refill_rgba", func(b *testing.B) {
+				e := cacheEngine(b)
+				if err := e.Resize(800, 600, scale); err != nil {
+					b.Fatal(err)
+				}
+				cache := newImageCache()
+				w := &countWriter{}
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					cache.Invalidate()
+					if _, err := cache.Present(w, e, float64(i%20)*30, 80, 24); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(w.n)/float64(b.N), "wire-B/op")
+			})
 			b.Run("full_png", func(b *testing.B) {
 				e := cacheEngine(b)
 				if err := e.Resize(800, 600, scale); err != nil {

@@ -1,6 +1,8 @@
 package render
 
 import (
+	"image"
+	"image/draw"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"golang.org/x/image/font/gofont/goregular"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/font/sfnt"
+	"golang.org/x/image/math/fixed"
 )
 
 const (
@@ -29,13 +32,95 @@ const (
 // Fonts are bundled so the binary works with an empty PATH and no system
 // fonts. Prefer familiar system faces where available; load CJK lazily.
 type fonts struct {
-	parsed []*opentype.Font
-	faces  map[faceKey]font.Face
-	cjk    bool
+	parsed    []*opentype.Font
+	faces     map[faceKey]font.Face
+	cjk       bool
+	masks     map[glyphKey]glyphMask
+	maskBytes int
 }
 type faceKey struct {
 	id   int
 	size float64
+}
+
+type advanceResult struct {
+	width fixed.Int26_6
+	ok    bool
+}
+
+type runePair struct{ first, second rune }
+
+// Repeated words should not repeatedly look up font tables during layout.
+// Caps keep documents with many distinct characters/pairs bounded.
+type measuredFace struct {
+	font.Face
+	advances map[rune]advanceResult
+	kerns    map[runePair]fixed.Int26_6
+}
+
+func (f *measuredFace) GlyphAdvance(r rune) (fixed.Int26_6, bool) {
+	if a, ok := f.advances[r]; ok {
+		return a.width, a.ok
+	}
+	width, ok := f.Face.GlyphAdvance(r)
+	if len(f.advances) < 4096 {
+		f.advances[r] = advanceResult{width, ok}
+	}
+	return width, ok
+}
+
+func (f *measuredFace) Kern(first, second rune) fixed.Int26_6 {
+	pair := runePair{first, second}
+	if k, ok := f.kerns[pair]; ok {
+		return k
+	}
+	k := f.Face.Kern(first, second)
+	if len(f.kerns) < 8192 {
+		f.kerns[pair] = k
+	}
+	return k
+}
+
+type glyphKey struct {
+	faceKey
+	r    rune
+	x, y uint8 // Exact 1/64-pixel phase; never round typography for caching.
+}
+
+type glyphMask struct {
+	rect image.Rectangle
+	mask *image.Alpha
+}
+
+const glyphCacheLimit = 16 << 20
+
+// OpenType reuses a scratch mask, so retain an owned copy. Integer translations
+// share a mask; fractional positions and font sizes remain distinct.
+func (f *fonts) glyph(id int, size float64, dot fixed.Point26_6, r rune) (image.Rectangle, *image.Alpha) {
+	key := glyphKey{faceKey{id, size}, r, uint8(dot.X & 63), uint8(dot.Y & 63)}
+	origin := image.Pt(dot.X.Floor(), dot.Y.Floor())
+	if g, ok := f.masks[key]; ok {
+		return g.rect.Add(origin), g.mask
+	}
+	dr, mask, maskp, _, _ := f.face(id, size).Glyph(dot, r)
+	if dr.Empty() {
+		return dr, nil
+	}
+	owned := image.NewAlpha(image.Rect(0, 0, dr.Dx(), dr.Dy()))
+	draw.Draw(owned, owned.Bounds(), mask, maskp, draw.Src)
+	cost := len(owned.Pix) + 128 // Include map/entry overhead in the budget.
+	if cost <= glyphCacheLimit {
+		if f.maskBytes+cost > glyphCacheLimit {
+			clear(f.masks)
+			f.maskBytes = 0
+		}
+		if f.masks == nil {
+			f.masks = make(map[glyphKey]glyphMask)
+		}
+		f.masks[key] = glyphMask{dr.Sub(origin), owned}
+		f.maskBytes += cost
+	}
+	return dr, owned
 }
 
 func newFonts() (*fonts, error) {
@@ -113,8 +198,9 @@ func (f *fonts) face(id int, size float64) font.Face {
 	if err != nil {
 		panic(err)
 	} // Parsed fonts and positive sizes are validated at entry.
-	f.faces[key] = face
-	return face
+	measured := &measuredFace{Face: face, advances: make(map[rune]advanceResult), kerns: make(map[runePair]fixed.Int26_6)}
+	f.faces[key] = measured
+	return measured
 }
 
 func (f *fonts) selectFont(r rune, flags int, size float64) int {
@@ -156,4 +242,6 @@ func (f *fonts) closeFaces() {
 		_ = face.Close()
 	}
 	f.faces = make(map[faceKey]font.Face)
+	f.masks = nil
+	f.maskBytes = 0
 }

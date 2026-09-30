@@ -11,7 +11,6 @@ import (
 	"sort"
 
 	xdraw "golang.org/x/image/draw"
-	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
 	"golang.org/x/image/vector"
 )
@@ -37,6 +36,12 @@ func (e *Engine) Frame(y float64) ([]byte, Metrics, error) {
 // Canvas paints an arbitrary document band into native pixels. PNG encoding
 // is used only by Frame/export; the interactive pager uploads these pixels.
 func (e *Engine) Canvas(y, height float64) (*image.RGBA, error) {
+	return e.CanvasInto(nil, y, height)
+}
+
+// CanvasInto lets a caller reuse its own scratch pixels after uploading them.
+// Canvas and Frame still return independent images for callers retaining crops.
+func (e *Engine) CanvasInto(im *image.RGBA, y, height float64) (*image.RGBA, error) {
 	if err := e.ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -44,38 +49,56 @@ func (e *Engine) Canvas(y, height float64) (*image.RGBA, error) {
 	if math.IsNaN(y) || math.IsInf(y, 0) || y < 0 || math.IsNaN(height) || math.IsInf(height, 0) || w < 1 || h < 1 || w*h > 32_000_000 {
 		return nil, fmt.Errorf("invalid canvas region or greater than 32 megapixels")
 	}
-	im := image.NewRGBA(image.Rect(0, 0, int(w), int(h)))
+	bounds := image.Rect(0, 0, int(w), int(h))
+	if im == nil || im.Bounds() != bounds {
+		im = image.NewRGBA(bounds)
+	}
 	draw.Draw(im, im.Bounds(), image.NewUniform(e.palette.bg), image.Point{}, draw.Src)
-	for _, op := range e.ops {
-		if op.y+op.h < y || op.y > y+height {
+	for _, group := range e.groups {
+		if group.bottom < y || group.top > y+height {
 			continue
 		}
-		if err := e.ctx.Err(); err != nil {
-			return nil, err
-		}
-		if op.checkmark {
-			r := pixels(op.rect, y, e.scale)
-			fill(im, r, op.color, op.radius*e.scale)
-			// A filled polygon makes the check independent of font coverage.
-			v := vector.NewRasterizer(r.Dx(), r.Dy())
-			points := [][2]float32{{.16, .51}, {.28, .39}, {.43, .56}, {.74, .22}, {.86, .34}, {.43, .81}}
-			for i, p := range points {
-				px, py := p[0]*float32(r.Dx()), p[1]*float32(r.Dy())
-				if i == 0 {
-					v.MoveTo(px, py)
-				} else {
-					v.LineTo(px, py)
-				}
+		for _, op := range e.ops[group.start:group.end] {
+			if op.y+op.h < y || op.y > y+height {
+				continue
 			}
-			v.ClosePath()
-			v.Draw(im, r, image.NewUniform(rgb(0xffffff)), image.Point{})
-		} else if op.image != nil {
-			r := pixels(op.rect, y, e.scale)
-			xdraw.BiLinear.Scale(im, r, op.image, op.image.Bounds(), draw.Over, nil)
-		} else if op.end > op.start {
-			e.paintLine(im, op, y)
-		} else {
-			fill(im, pixels(op.rect, y, e.scale), op.color, op.radius*e.scale)
+			if err := e.ctx.Err(); err != nil {
+				return nil, err
+			}
+			if op.checkmark {
+				r := pixels(op.rect, y, e.scale)
+				fill(im, r, op.color, op.radius*e.scale)
+				// A filled polygon makes the check independent of font coverage.
+				v := vector.NewRasterizer(r.Dx(), r.Dy())
+				points := [][2]float32{{.16, .51}, {.28, .39}, {.43, .56}, {.74, .22}, {.86, .34}, {.43, .81}}
+				for i, p := range points {
+					px, py := p[0]*float32(r.Dx()), p[1]*float32(r.Dy())
+					if i == 0 {
+						v.MoveTo(px, py)
+					} else {
+						v.LineTo(px, py)
+					}
+				}
+				v.ClosePath()
+				v.Draw(im, r, image.NewUniform(rgb(0xffffff)), image.Point{})
+			} else if op.image != nil {
+				r := pixels(op.rect, y, e.scale)
+				xdraw.BiLinear.Scale(im, r, op.image, op.image.Bounds(), draw.Over, nil)
+			} else if op.end > op.start {
+				e.paintLine(im, op, y)
+			} else {
+				fill(im, pixels(op.rect, y, e.scale), op.color, op.radius*e.scale)
+			}
+		}
+	}
+	if e.focusedLink > 0 && e.focusedLink <= len(e.links) {
+		for _, r := range e.links[e.focusedLink-1].Rects {
+			if r.Y+r.Height < y || r.Y > y+height {
+				continue
+			}
+			for _, edge := range []rect{{r.X, r.Y, r.Width, 1}, {r.X, r.Y + r.Height - 1, r.Width, 1}, {r.X, r.Y, 1, r.Height}, {r.X + r.Width - 1, r.Y, 1, r.Height}} {
+				fill(im, pixels(edge, y, e.scale), e.palette.link, 0)
+			}
 		}
 	}
 	return im, nil
@@ -111,8 +134,16 @@ func (e *Engine) paintLine(im *image.RGBA, op operation, y float64) {
 			}
 			fill(im, pixels(rect{g.x, op.y, g.w, op.h}, y, e.scale), bg, 0)
 		}
-		d := font.Drawer{Dst: im, Src: image.NewUniform(c), Face: e.fonts.face(g.face, g.style.size*e.scale), Dot: fixed.Point26_6{X: fixed.Int26_6(math.Round(g.x * e.scale * 64)), Y: fixed.Int26_6(math.Round((g.y - y) * e.scale * 64))}}
-		d.DrawString(string(g.r))
+		dot := fixed.Point26_6{X: fixed.Int26_6(math.Round(g.x * e.scale * 64)), Y: fixed.Int26_6(math.Round((g.y - y) * e.scale * 64))}
+		dr, mask := e.fonts.glyph(g.face, g.style.size*e.scale, dot, g.r)
+		if !dr.Empty() {
+			ink := e.inks[c]
+			if ink == nil {
+				ink = image.NewUniform(c)
+				e.inks[c] = ink
+			}
+			draw.DrawMask(im, dr, ink, image.Point{}, mask, image.Point{}, draw.Over)
+		}
 		if g.style.flags&strike != 0 {
 			fill(im, pixels(rect{g.x, g.y - g.style.size*.3, g.w, 1}, y, e.scale), c, 0)
 		}
@@ -124,8 +155,9 @@ func pixels(r rect, y, scale float64) image.Rectangle {
 }
 
 func fill(im *image.RGBA, r image.Rectangle, c color.RGBA, radius float64) {
+	ink := image.NewUniform(c)
 	if radius <= 0 {
-		draw.Draw(im, r, image.NewUniform(c), image.Point{}, draw.Src)
+		draw.Draw(im, r, ink, image.Point{}, draw.Src)
 		return
 	}
 	radius = math.Min(radius, float64(min(r.Dx(), r.Dy()))/2)
@@ -133,6 +165,6 @@ func fill(im *image.RGBA, r image.Rectangle, c color.RGBA, radius float64) {
 		dy := math.Max(0, math.Max(float64(r.Min.Y)+radius-(float64(y)+.5), (float64(y)+.5)-(float64(r.Max.Y)-radius)))
 		inset := radius - math.Sqrt(math.Max(0, radius*radius-dy*dy))
 		line := image.Rect(r.Min.X+int(math.Round(inset)), y, r.Max.X-int(math.Round(inset)), y+1)
-		draw.Draw(im, line, image.NewUniform(c), image.Point{}, draw.Src)
+		draw.Draw(im, line, ink, image.Point{}, draw.Src)
 	}
 }

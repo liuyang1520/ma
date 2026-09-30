@@ -33,7 +33,13 @@ func (e *Engine) block(n ast.Node, x, y, width float64, s style, depth int) floa
 		if n.Level == 6 {
 			s.color = e.palette.muted
 		}
-		y = e.flow(e.inline(n, s), x, y, width, s, 1.25, false, extast.AlignLeft)
+		spans := e.inline(n, s)
+		var label strings.Builder
+		for _, sp := range spans {
+			label.WriteString(sp.text)
+		}
+		e.headings = append(e.headings, Heading{Text: label.String(), ID: e.headingID(label.String()), Level: n.Level, Y: y})
+		y = e.flow(spans, x, y, width, s, 1.25, false, extast.AlignLeft)
 		if n.Level <= 2 {
 			y += s.size * .3
 			e.box(rect{x, y, width, 1}, e.palette.line, 0)
@@ -113,8 +119,8 @@ func (e *Engine) codeBlock(text string, x, y, width float64, s style) float64 {
 
 func (e *Engine) inline(parent ast.Node, s style) []span {
 	var spans []span
-	var walk func(ast.Node, style, int)
-	walk = func(n ast.Node, s style, depth int) {
+	var walk func(ast.Node, style, int, int)
+	walk = func(n ast.Node, s style, depth, linkID int) {
 		if depth > 64 {
 			return
 		}
@@ -124,15 +130,15 @@ func (e *Engine) inline(parent ast.Node, s style) []span {
 			if !n.IsRaw() {
 				value = html.UnescapeString(string(util.UnescapePunctuations([]byte(value))))
 			}
-			spans = append(spans, span{text: value, style: s})
+			spans = append(spans, span{text: value, style: s, link: linkID})
 			if n.HardLineBreak() {
-				spans = append(spans, span{text: "\n", style: s})
+				spans = append(spans, span{text: "\n", style: s, link: linkID})
 			} else if n.SoftLineBreak() {
-				spans = append(spans, span{text: " ", style: s})
+				spans = append(spans, span{text: " ", style: s, link: linkID})
 			}
 			return
 		case *ast.String:
-			spans = append(spans, span{text: string(n.Value), style: s})
+			spans = append(spans, span{text: string(n.Value), style: s, link: linkID})
 			return
 		case *ast.Emphasis:
 			if n.Level == 2 {
@@ -152,28 +158,29 @@ func (e *Engine) inline(parent ast.Node, s style) []span {
 			}
 			s.size *= .85
 			s.flags |= mono | code
-			spans = append(spans, span{text: strings.ReplaceAll(text.String(), "\n", " "), style: s})
+			spans = append(spans, span{text: strings.ReplaceAll(text.String(), "\n", " "), style: s, link: linkID})
 			return
 		case *ast.Link, *ast.AutoLink:
 			s.color = e.palette.link
+			linkID = e.linkIDs[n]
 			if link, ok := n.(*ast.AutoLink); ok {
-				spans = append(spans, span{text: string(link.Label(e.source)), style: s})
+				spans = append(spans, span{text: string(link.Label(e.source)), style: s, link: linkID})
 				return
 			}
 		case *extast.Strikethrough:
 			s.flags |= strike
 		case *ast.Image:
-			spans = append(spans, span{picture: string(n.Destination), text: string(n.Text(e.source)), style: s})
+			spans = append(spans, span{picture: string(n.Destination), text: string(n.Text(e.source)), style: s, link: linkID})
 			return
 		case *extast.TaskCheckBox, *ast.RawHTML:
 			return
 		}
 		for child := n.FirstChild(); child != nil; child = child.NextSibling() {
-			walk(child, s, depth+1)
+			walk(child, s, depth+1, linkID)
 		}
 	}
 	for n := parent.FirstChild(); n != nil; n = n.NextSibling() {
-		walk(n, s, 0)
+		walk(n, s, 0, 0)
 	}
 	return spans
 }
@@ -184,12 +191,13 @@ type character struct {
 	face, index int
 	width       float64
 	left        float64
+	link        int
 }
 
 // flow wraps words across styling boundaries. A long word is split by glyph
 // so a URL or unbroken code token cannot draw outside the content box.
 func (e *Engine) flow(spans []span, x, y, width float64, base style, leading float64, pre bool, alignment extast.Alignment) float64 {
-	var line []character
+	line := e.line[:0]
 	lineWidth := 0.0
 	flush := func(force bool) {
 		if len(line) == 0 && !force {
@@ -219,17 +227,18 @@ func (e *Engine) flow(spans []span, x, y, width float64, base style, leading flo
 		}
 		start := len(e.glyphs)
 		for _, c := range line {
-			e.glyphs = append(e.glyphs, glyph{r: c.r, x: xpos + c.left, y: baseline, w: c.width - c.left, style: c.style, face: c.face, index: c.index})
+			e.glyphs = append(e.glyphs, glyph{r: c.r, x: xpos + c.left, y: baseline, w: c.width - c.left, style: c.style, face: c.face, index: c.index, link: c.link})
+			e.addLinkRect(c.link, rect{math.Max(x, xpos), y, math.Min(x+width, xpos+c.width) - math.Max(x, xpos), lineHeight})
 			xpos += c.width
 		}
 		if len(e.glyphs) > start {
 			e.ops = append(e.ops, operation{rect: rect{x, y, width, lineHeight}, start: start, end: len(e.glyphs)})
 		}
 		y += lineHeight
-		line = nil
+		line = line[:0]
 		lineWidth = 0
 	}
-	var word []character
+	word := e.word[:0]
 	wordWidth := 0.0
 	appendChar := func(c character) {
 		if c.r == '\n' {
@@ -258,7 +267,7 @@ func (e *Engine) flow(spans []span, x, y, width float64, base style, leading flo
 		for _, c := range word {
 			appendChar(c)
 		}
-		word = nil
+		word = word[:0]
 		wordWidth = 0
 	}
 	lastSpace := false
@@ -273,6 +282,7 @@ func (e *Engine) flow(spans []span, x, y, width float64, base style, leading flo
 				w := math.Min(width, float64(im.Bounds().Dx()))
 				h := w * float64(im.Bounds().Dy()) / float64(im.Bounds().Dx())
 				e.ops = append(e.ops, operation{rect: rect{x, y, w, h}, image: im})
+				e.addLinkRect(sp.link, rect{x, y, w, h})
 				y += h + 8
 				continue
 			}
@@ -305,7 +315,7 @@ func (e *Engine) flow(spans []span, x, y, width float64, base style, leading flo
 				id := e.fonts.selectFont(r, sp.style.flags, sp.style.size)
 				advance, _ := e.fonts.face(id, sp.style.size).GlyphAdvance(r)
 				w := float64(advance) / 64
-				c := character{r: r, style: sp.style, face: id, index: index, width: w}
+				c := character{r: r, style: sp.style, face: id, index: index, width: w, link: sp.link}
 				if sp.style.flags&code != 0 {
 					if first {
 						c.left = 3
@@ -339,6 +349,13 @@ func (e *Engine) flow(spans []span, x, y, width float64, base style, leading flo
 	}
 	flushWord()
 	flush(false)
+	e.line = line[:0]
+	// An unusually long unbroken token need not stay resident after layout.
+	if cap(word) <= 8192 {
+		e.word = word[:0]
+	} else {
+		e.word = nil
+	}
 	e.text = append(e.text, '\n')
 	return y
 }

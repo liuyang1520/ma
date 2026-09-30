@@ -16,7 +16,7 @@ import (
 	"golang.org/x/term"
 )
 
-const version = "0.2.2"
+const version = "0.3.0"
 const maxSource = 16 << 20
 
 func main() {
@@ -55,9 +55,10 @@ func run() error {
 	width := fs.Int("width", 1000, "export viewport width in logical pixels")
 	height := fs.Int("height", 800, "export viewport height in logical pixels")
 	force := fs.Bool("force-graphics", false, "skip Kitty capability detection")
+	watch := fs.Bool("watch", false, "reload a file automatically when it changes")
 	showVersion := fs.Bool("version", false, "print version")
 	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage: ma [options] FILE.md\n       cat FILE.md | ma\n\nA native Markdown pager with real heading sizes over Kitty graphics.\nRequires a Kitty graphics terminal such as Ghostty. No browser needed.\n\nKeys: j/k, arrows, space/b, d/u, g/G, /, n/N, +/-, t, r, ?, q.\n\nOptions:")
+		fmt.Fprintln(fs.Output(), "Usage: ma [options] FILE.md\n       cat FILE.md | ma\n\nA native Markdown pager with real heading sizes over Kitty graphics.\nRequires a Kitty graphics terminal such as Ghostty. No browser needed.\n\nKeys: j/k, arrows, space/b, d/u, g/G, [/], /, n/N, Tab/Shift-Tab, Enter, h/l (back/forward), +/-, t, r, ?, q.\nClick links to open Markdown inside ma or web URLs in the default browser.\n\nOptions:")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -94,6 +95,9 @@ func run() error {
 	}
 	if path == "-" && term.IsTerminal(int(os.Stdin.Fd())) {
 		return fmt.Errorf("pipe Markdown into ma, or provide a file")
+	}
+	if *watch && (path == "-" || *export != "") {
+		return fmt.Errorf("--watch requires a file in the interactive pager")
 	}
 	source, err := readSource(path)
 	if err != nil {
@@ -137,8 +141,13 @@ func run() error {
 		return nil
 	}
 	opts := pager.Options{Name: name, BaseDir: baseDir, Theme: *theme, Source: source, FontSize: *fontSize, Scale: *scale, ForceGraphics: *force}
+	opts.OpenDocument = func(path string) (pager.Document, error) { return openDocument(path, *watch) }
 	if path != "-" {
-		opts.Reload = func() ([]byte, error) { return readSource(path) }
+		opts.Path = filepath.Join(baseDir, name)
+		opts.Reload = func() ([]byte, error) { return readSource(opts.Path) }
+		if *watch {
+			opts.Watch = fileWatcher(opts.Path, source)
+		}
 	}
 	return pager.Run(ctx, opts)
 }

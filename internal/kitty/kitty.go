@@ -9,30 +9,54 @@ import (
 	"fmt"
 	"image"
 	"io"
+	"sync"
 )
 
 const ImageID = 1073741821
 const QueryID = 1073741820
 const SecondImageID = ImageID + 1
 
+type compressor struct {
+	buffer bytes.Buffer
+	writer *zlib.Writer
+}
+
+var compressors = sync.Pool{New: func() any {
+	c := &compressor{}
+	// Level 2 measured faster than BestSpeed for large native text canvases,
+	// while also reducing transfer size. Keep the tradeoff reproducible.
+	c.writer, _ = zlib.NewWriterLevel(&c.buffer, 2)
+	return c
+}}
+
 // Upload stores an opaque native canvas in the terminal without displaying
 // it. Compression is lossless zlib over RGBA bytes, with no PNG filtering.
 func Upload(w io.Writer, id int, canvas *image.RGBA) error {
-	var compressed bytes.Buffer
-	z, err := zlib.NewWriterLevel(&compressed, zlib.BestSpeed)
-	if err != nil {
-		return err
-	}
+	c := compressors.Get().(*compressor)
+	c.buffer.Reset()
+	c.writer.Reset(&c.buffer)
+	defer func() {
+		// Do not retain unusually large compressed images in the pool.
+		if c.buffer.Cap() <= 8<<20 {
+			compressors.Put(c)
+		}
+	}()
 	width, height := canvas.Bounds().Dx(), canvas.Bounds().Dy()
-	for y := 0; y < height; y++ {
-		if _, err = z.Write(canvas.Pix[y*canvas.Stride : y*canvas.Stride+width*4]); err != nil {
+	if canvas.Stride == width*4 {
+		if _, err := c.writer.Write(canvas.Pix[:height*canvas.Stride]); err != nil {
 			return err
 		}
+	} else {
+		for y := 0; y < height; y++ {
+			if _, err := c.writer.Write(canvas.Pix[y*canvas.Stride : y*canvas.Stride+width*4]); err != nil {
+				return err
+			}
+		}
 	}
-	if err = z.Close(); err != nil {
+	if err := c.writer.Close(); err != nil {
 		return err
 	}
-	return transmit(w, fmt.Sprintf("a=t,t=d,f=32,o=z,i=%d,s=%d,v=%d,q=2", id, width, height), compressed.Bytes())
+	return transmit(w, fmt.Sprintf("a=t,t=d,f=32,o=z,i=%d,s=%d,v=%d,q=2", id, width, height), c.buffer.Bytes())
 }
 
 // Place replaces an existing placement with a new crop. Cached scrolls send
@@ -48,18 +72,26 @@ func Hide(w io.Writer, id int) error {
 }
 
 func transmit(w io.Writer, header string, data []byte) error {
-	encoded := base64.StdEncoding.EncodeToString(data)
-	for start := 0; start < len(encoded); start += 4096 {
-		end := min(start+4096, len(encoded))
+	var encoded [4096]byte
+	for start := 0; start < len(data); start += 3072 {
+		end := min(start+3072, len(data))
+		payload := encoded[:base64.StdEncoding.EncodedLen(end-start)]
+		base64.StdEncoding.Encode(payload, data[start:end])
 		more := 0
-		if end < len(encoded) {
+		if end < len(data) {
 			more = 1
 		}
 		params := fmt.Sprintf("m=%d,q=2", more)
 		if start == 0 {
 			params = fmt.Sprintf("%s,m=%d", header, more)
 		}
-		if _, err := fmt.Fprintf(w, "\x1b_G%s;%s\x1b\\", params, encoded[start:end]); err != nil {
+		if _, err := fmt.Fprintf(w, "\x1b_G%s;", params); err != nil {
+			return err
+		}
+		if _, err := w.Write(payload); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(w, "\x1b\\"); err != nil {
 			return err
 		}
 	}
